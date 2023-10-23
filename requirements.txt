@@ -1,6 +1,1 @@
-numpy
-opencv-python
-tensorflow
 timm
-torch
-tqdm

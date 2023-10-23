@@ -1,7 +1,12 @@
-import argparse
-import os
+import config
+from ckpt_utils import load_checkpoint, save_checkpoint
 
+import os
+import time
+import logging
+import argparse
 import numpy as np
+
 import timm
 import torch
 import torch.nn as nn
@@ -59,7 +64,7 @@ def parse_args():
         "--model", type=str, required=False, default="xception71", help="CNN model name"
     )
     parser.add_argument("--lr", type=float, required=False, default=1e-3)
-    parser.add_argument("--batch-size", type=int, required=False, default=48)
+    parser.add_argument("--batch-size", type=int, required=False, default=8)
     parser.add_argument("--n-epochs", type=int, required=False, default=60)
 
     parser.add_argument("--valid-limit", type=int, required=False, default=24 * 100)
@@ -83,6 +88,7 @@ def parse_args():
     return args
 
 
+
 class Model(nn.Module):
     def __init__(
         self, model_name, in_channels=IN_CHANNELS, time_limit=TL, n_traj=N_TRAJS
@@ -91,12 +97,21 @@ class Model(nn.Module):
 
         self.n_traj = n_traj
         self.time_limit = time_limit
-        self.model = timm.create_model(
-            model_name,
-            pretrained=True,
-            in_chans=in_channels,
-            num_classes=self.n_traj * 2 * self.time_limit + self.n_traj,
-        )
+        f = 1
+        while f: 
+            try: 
+                self.model = timm.create_model(
+                    model_name,
+                    pretrained=True,
+                    in_chans=in_channels,
+                    num_classes=self.n_traj * 2 * self.time_limit + self.n_traj,
+                )
+                f=0
+                logging.info("Model Loaded !!!")
+                print("Model Loaded !!!")
+            except:
+                logging.error("Loading model failed, trying again")
+                print("Loading model failed, trying again")
 
 
     def forward(self, x):
@@ -197,19 +212,56 @@ class WaymoLoader(Dataset):
 
 def main():
     args = parse_args()
+    os.makedirs(config.DIR.OUT_DIR, exist_ok=True)
+    os.makedirs(config.DIR.CKPT_DIR, exist_ok=True)
+    os.makedirs(config.DIR.TB_DIR, exist_ok=True)
+    os.makedirs(config.DIR.VIS_DIR, exist_ok=True)
 
-    summary_writer = SummaryWriter(os.path.join(args.save, "logs"))
+    # make csv best log file
+    with open(os.path.join(config.DIR.OUT_DIR, "best_logs.csv"), "w") as f:
+        f.write("epoch,loss\n")
+        
+    summary_writer = SummaryWriter(config.DIR.TB_DIR)
+    logging.basicConfig(filename=os.path.join(config.DIR.OUT_DIR, 'train.log'), encoding='utf-8', level=logging.DEBUG, format='%(levelname)s:%(asctime)s %(message)s')
+    
+    model_name = config.MODEL_NAME
+    time_limit = config.FUTURE_TS
+    n_traj = config.N_TRAJ
+    model = Model(
+        model_name, in_channels=config.IN_CHANNELS, time_limit=time_limit, n_traj=n_traj
+    )
+    model = nn.DataParallel(model)
+    model.cuda()
 
-    train_path = args.train_data
-    dev_path = args.dev_data
-    path_to_save = args.save
-    if not os.path.exists(path_to_save):
-        os.mkdir(path_to_save)
+    lr = config.LR
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    
+    if os.path.exists(os.path.join(config.DIR.CKPT_DIR, "last_model.pth")):
+        config.LOAD_MODEL = True
+    
+  
+    # Continue from last checkpoint
+    if config.LOAD_MODEL:
+        logging.info("Loading model from last checkpoint")
+        end_epoch = load_checkpoint(os.path.join(config.DIR.CKPT_DIR, "last_model.pth"), model, optimizer)
+    else : 
+        logging.info("No checkpoint found, starting from scratch")
+        end_epoch = 0
+    
+    if os.path.exists(os.path.join(config.DIR.OUT_DIR, "best_logs.csv")):
+        with open(os.path.join(config.DIR.OUT_DIR, "best_logs.csv"), "r") as f:
+            n = 0
+            for line in f.readlines():
+                n += 1
+        best_loss = float(line.split(",")[1])
+    else:
+        best_loss = 1e9
 
-    dataset = WaymoLoader(train_path)
+    dataset = WaymoLoader(config.DIR.TRAIN_DIR)
 
-    batch_size = args.batch_size
-    num_workers = min(16, batch_size)
+    batch_size = config.TRAIN_BS
+    num_workers = config.N_WORKERS
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -219,7 +271,7 @@ def main():
         persistent_workers=True,
     )
 
-    val_dataset = WaymoLoader(dev_path, limit=args.valid_limit)
+    val_dataset = WaymoLoader(config.DIR.VAL_DIR, limit=args.valid_limit)
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size * 2,
@@ -229,16 +281,6 @@ def main():
         persistent_workers=True,
     )
 
-    model_name = args.model
-    time_limit = args.time_limit
-    n_traj = args.n_traj
-    model = Model(
-        model_name, in_channels=args.in_channels, time_limit=time_limit, n_traj=n_traj
-    )
-    model.cuda()
-
-    lr = args.lr
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
@@ -248,27 +290,17 @@ def main():
         last_epoch=-1,
     )
 
-    start_iter = 0
-    best_loss = float("+inf")
     glosses = []
 
     tr_it = iter(dataloader)
-    n_epochs = args.n_epochs
-    progress_bar = tqdm(range(start_iter, len(dataloader) * n_epochs))
-
-    saver = lambda name: torch.save(
-        {
-            "score": best_loss,
-            "iteration": iteration,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "loss": loss.item(),
-        },
-        os.path.join(path_to_save, name),
-    )
+    n_epochs = config.EPOCHS
+    # progress_bar = tqdm(range(0, n_epochs * len(dataloader)), position=end_epoch*len(dataloader))
+    progress_bar = range(end_epoch*len(dataloader), n_epochs * len(dataloader))
 
     for iteration in progress_bar:
+        if iteration % config.LOG_STEP == 0:
+            logging.info(f"iteration: {iteration} / {n_epochs * len(dataloader)}")
+
         model.train()
         try:
             x, y, is_available = next(tr_it)
@@ -291,11 +323,17 @@ def main():
 
         glosses.append(loss.item())
         if (iteration + 1) % args.n_monitor_train == 0:
-            progress_bar.set_description(
+            # progress_bar.set_description(
+            #     f"loss: {loss.item():.3}"
+            #     f" avg: {np.mean(glosses[-100:]):.2}"
+            #     f" {scheduler.get_last_lr()[-1]:.3}"
+            # )
+            logging.info(
                 f"loss: {loss.item():.3}"
                 f" avg: {np.mean(glosses[-100:]):.2}"
                 f" {scheduler.get_last_lr()[-1]:.3}"
             )
+
             summary_writer.add_scalar("train/loss", loss.item(), iteration)
             summary_writer.add_scalar("lr", scheduler.get_last_lr()[-1], iteration)
 
@@ -315,24 +353,59 @@ def main():
 
                 summary_writer.add_scalar("dev/loss", np.mean(val_losses), iteration)
 
-            saver("model_last.pth")
+                mean_val_loss = np.mean(val_losses)
+                if mean_val_loss < best_loss:
+                        best_loss = mean_val_loss
+                        save_checkpoint(
+                            config.DIR.CKPT_DIR,
+                            model,
+                            optimizer,
+                            end_epoch,
+                            date=current_time,
+                            model_name=None,
+                            name="model_best",
+                        )
+                        with open(os.path.join(config.DIR.OUT_DIR, "best_logs.csv"), "a") as f:
+                            f.write(f"{end_epoch},{best_loss}\n")
+                            
+                        model.eval()
+                        with torch.no_grad():
+                            traced_model = torch.jit.trace(
+                                model,
+                                torch.rand(
+                                    1, config.IN_CHANNELS, args.img_res, args.img_res
+                                ).cuda(),
+                            )
 
-            mean_val_loss = np.mean(val_losses)
-            if mean_val_loss < best_loss:
-                best_loss = mean_val_loss
-                saver("model_best.pth")
+                        traced_model.save(os.path.join(config.DIR.OUT_DIR, "model_best.pt"))
+                        del traced_model
 
-                model.eval()
-                with torch.no_grad():
-                    traced_model = torch.jit.trace(
-                        model,
-                        torch.rand(
-                            1, args.in_channels, args.img_res, args.img_res
-                        ).cuda(),
-                    )
+                        
+        if (iteration+1) % len(dataloader) == 0:
+            t = time.localtime()
+            current_time = time.strftime("%Y-%m-%d_%H-%M-%S", t)
+            save_checkpoint(
+                config.DIR.CKPT_DIR,
+                model,
+                optimizer,
+                end_epoch,
+                date=None,
+                model_name=None,
+                name="last_model",
+            )
+            
+            save_checkpoint(
+                config.DIR.CKPT_DIR,
+                model,
+                optimizer,
+                end_epoch,
+                date=current_time,
+                model_name=None,
+                name=f"model_{end_epoch}",
+            )
+            
+            end_epoch += 1
 
-                traced_model.save(os.path.join(path_to_save, "model_best.pt"))
-                del traced_model
 
 
 if __name__ == "__main__":
