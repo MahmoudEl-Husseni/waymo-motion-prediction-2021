@@ -6,6 +6,7 @@ import time
 import logging
 import argparse
 import numpy as np
+from utils import *
 
 import timm
 import torch
@@ -223,24 +224,26 @@ def main():
         
     summary_writer = SummaryWriter(config.DIR.TB_DIR)
     logging.basicConfig(filename=os.path.join(config.DIR.OUT_DIR, 'train.log'), encoding='utf-8', level=logging.DEBUG, format='%(levelname)s:%(asctime)s %(message)s')
-    
-    model_name = config.MODEL_NAME
-    time_limit = config.FUTURE_TS
-    n_traj = config.N_TRAJ
-    model = Model(
-        model_name, in_channels=config.IN_CHANNELS, time_limit=time_limit, n_traj=n_traj
-    )
+    try: 
+        model_name = config.MODEL_NAME
+        time_limit = config.FUTURE_TS
+        n_traj = config.N_TRAJ
+        model = Model(
+            model_name, in_channels=config.IN_CHANNELS, time_limit=time_limit, n_traj=n_traj
+        )
+    except Exception as e:
+        logging.error("Loading model failed, trying again\n", str(e.__traceback__.tb_lineno)) 
+        print("Loading model failed, trying again\n", str(e.__traceback__.tb_lineno))
     model = nn.DataParallel(model)
     model.cuda()
 
     lr = config.LR
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     
-    
     if os.path.exists(os.path.join(config.DIR.CKPT_DIR, "last_model.pth")):
         config.LOAD_MODEL = True
     
-  
+    
     # Continue from last checkpoint
     if config.LOAD_MODEL:
         logging.info("Loading model from last checkpoint")
@@ -254,7 +257,10 @@ def main():
             n = 0
             for line in f.readlines():
                 n += 1
-        best_loss = float(line.split(",")[1])
+        if n > 1:
+            best_loss = float(line.split(",")[1])
+        else : 
+            best_loss = 1e9
     else:
         best_loss = 1e9
 
@@ -266,9 +272,9 @@ def main():
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        # num_workers=num_workers,
         pin_memory=False,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
     val_dataset = WaymoLoader(config.DIR.VAL_DIR, limit=args.valid_limit)
@@ -276,9 +282,9 @@ def main():
         val_dataset,
         batch_size=batch_size * 2,
         shuffle=False,
-        num_workers=num_workers,
+        # num_workers=num_workers,
         pin_memory=False,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
 
@@ -294,10 +300,9 @@ def main():
 
     tr_it = iter(dataloader)
     n_epochs = config.EPOCHS
-    # progress_bar = tqdm(range(0, n_epochs * len(dataloader)), position=end_epoch*len(dataloader))
-    progress_bar = range(end_epoch*len(dataloader), n_epochs * len(dataloader))
-
-    for iteration in progress_bar:
+    # progress_bar_ex = tqdm(range(0, n_epochs * len(dataloader)), position=end_epoch*len(dataloader))
+    progress_bar_ex = range(end_epoch*len(dataloader), n_epochs * len(dataloader))
+    for iteration in progress_bar_ex:
         if iteration % config.LOG_STEP == 0:
             logging.info(f"iteration: {iteration} / {n_epochs * len(dataloader)}")
 
@@ -323,7 +328,7 @@ def main():
 
         glosses.append(loss.item())
         if (iteration + 1) % args.n_monitor_train == 0:
-            # progress_bar.set_description(
+            # progress_bar_ex.set_description(
             #     f"loss: {loss.item():.3}"
             #     f" avg: {np.mean(glosses[-100:]):.2}"
             #     f" {scheduler.get_last_lr()[-1]:.3}"
@@ -337,7 +342,7 @@ def main():
             summary_writer.add_scalar("train/loss", loss.item(), iteration)
             summary_writer.add_scalar("lr", scheduler.get_last_lr()[-1], iteration)
 
-        if (iteration + 1) % args.n_monitor_validate == 0:
+        if (iteration + 1) % config.N_MONITOR_VALIDATE == 0:
             optimizer.zero_grad()
             model.eval()
             with torch.no_grad():
@@ -352,7 +357,9 @@ def main():
                     val_losses.append(loss.item())
 
                 summary_writer.add_scalar("dev/loss", np.mean(val_losses), iteration)
+                t = time.localtime()
 
+                current_time = time.strftime("%Y-%m-%d_%H-%M-%S", t)
                 mean_val_loss = np.mean(val_losses)
                 if mean_val_loss < best_loss:
                         best_loss = mean_val_loss
@@ -368,21 +375,22 @@ def main():
                         with open(os.path.join(config.DIR.OUT_DIR, "best_logs.csv"), "a") as f:
                             f.write(f"{end_epoch},{best_loss}\n")
                             
-                        model.eval()
-                        with torch.no_grad():
-                            traced_model = torch.jit.trace(
-                                model,
-                                torch.rand(
-                                    1, config.IN_CHANNELS, args.img_res, args.img_res
-                                ).cuda(),
-                            )
+                        #model.eval()
+                        #with torch.no_grad():
+                            #traced_model = torch.jit.trace(
+                                #model,
+                                #torch.rand(
+                     #               1, config.IN_CHANNELS, args.img_res, args.img_res
+                      #          ).cuda(),
+                      #      )
 
-                        traced_model.save(os.path.join(config.DIR.OUT_DIR, "model_best.pt"))
-                        del traced_model
+                    #    traced_model.save(os.path.join(config.DIR.OUT_DIR, "model_best.pt"))
+                    #    del traced_model
 
-                        
+        # End of Epoch                
         if (iteration+1) % len(dataloader) == 0:
             t = time.localtime()
+
             current_time = time.strftime("%Y-%m-%d_%H-%M-%S", t)
             save_checkpoint(
                 config.DIR.CKPT_DIR,
@@ -406,7 +414,9 @@ def main():
             
             end_epoch += 1
 
-
-
 if __name__ == "__main__":
-    main()
+    try: 
+        main()
+    except Exception as e:
+        logging.error("Training failed\n", str(e.__traceback__.tb_lineno)) 
+        print("Training failed\n", str(e.__traceback__.tb_lineno))

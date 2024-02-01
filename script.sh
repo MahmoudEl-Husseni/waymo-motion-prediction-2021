@@ -1,3 +1,4 @@
+#sleep 2m
 MODEL_NAME=xception71
 python train.py \
     --train-data ./train \

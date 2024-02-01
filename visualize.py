@@ -1,8 +1,13 @@
 import argparse
 import os
 
+import config
+from train import Model
+from ckpt_utils import load_checkpoint
+
 import numpy as np
 import torch
+import timm
 from matplotlib import pyplot as plt
 from matplotlib.pyplot import figure
 from torch.utils.data import DataLoader
@@ -25,10 +30,21 @@ def parse_args():
 
 def main():
     args = parse_args()
+    model_name = config.MODEL_NAME
+    time_limit = config.FUTURE_TS
+    n_traj = config.N_TRAJ
+    model = Model(
+            model_name, in_channels=config.IN_CHANNELS, time_limit=time_limit, n_traj=n_traj
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+    # end_epoch = load_checkpoint(args.model, model, optimizer)
+    end_epoch = load_checkpoint(os.path.join(config.DIR.CKPT_DIR, "last_model.pth"), model, optimizer)
+    
     if not os.path.exists(args.save):
         os.mkdir(args.save)
 
-    model = torch.jit.load(args.model).cuda().eval()
+    # model = torch.jit.load(args.model).cuda().eval()
+    # model = torch.load(args.model).cuda().eval()
     loader = DataLoader(
         WaymoLoader(args.data, return_vector=True),
         batch_size=1,
